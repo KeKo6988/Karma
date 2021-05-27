@@ -1,0 +1,808 @@
+Rapporto del tesoro di Patract Hub per Europa v0.2 (contratto e sandbox runtime)
+
+pubblicato
+ 
+in
+Tesoro
+4 mesi fa
+(modificato)
+Sei settimane fa, Patract Hub (https://patract.io) ha applicato una proposta di tesoreria n. 27 per Europa v0.2, e ora abbiamo terminato tutto il lavoro di sviluppo in (https://github.com/patractlabs/Europa) . Europa è una specie di un'altra implementazione per il client Substrate nel nostro progetto. Sappiamo che il runtime di una blockchain è la logica di business che definisce il suo comportamento e il runtime di Substrate deve essere eseguito da un esecutore e da un ambiente. In modo da progettare l'esecutore e l'ambiente più come una "sandbox" per eseguire un runtime di substrato.
+
+Nella v0.2, l'obiettivo principale è modificare Pallet Contractsin runtime per fornire informazioni di debug più dettagliate, comprese le informazioni sul processo di esecuzione del contratto (nel Pallet Contractslivello) e le informazioni sull'esecuzione WASM (nel livello di esecuzione WASMI).
+
+Riepilogo del piano futuro di Europa
+~~ v0.1: disporre di un ambiente di runtime indipendente per facilitare più direzioni di espansione successive. ~~
+~~ v0.2: Modifica a FRAME Contracts a livello pallet per fornire maggiori informazioni ~~
+v0.3: Migliora l'esperienza di sviluppo, rafforza la collaborazione con altri strumenti ed estendi la sandbox per essere compatibile con altri moduli di runtime。
+Riepilogo della verifica per Europa v0.2:
+Costruisci contratti errati ed esegui la stampa dei registri per determinare se soddisfa le aspettative
+Visualizza le statistiche delle chiamate define_env!dell'interfaccia durante l'esecuzione del contratto
+Eseguire la funzione di stampa del registro, fornire esempi di stampa formattata di dati diversi e valutare se soddisfa le aspettative
+Costruisci un contratto che si arresti in modo anomalo in condizioni diverse e registra il registro dopo l'esecuzione. Quindi giudicare se le informazioni di backtrace dell'esecuzione del contratto sono state completamente stampate e verificare se corrispondono all'effettiva esecuzione del contratto collassato.
+1.Design
+In 0.2, la funzione di informazioni di debug del modulo del contratto di aggiornamento è divisa in tre parti di modifica:
+
+Modifica sul Pallet Contractslivello: aggiungendo la traccia durante l'esecuzione del contratto da Pallet Contracts, le informazioni nel livello del contratto vengono registrate e il livello chiamante del contratto viene registrato. D'altra parte, il messaggio di errore di chiamata all'esecuzione di WASM è migliorato.
+Modification on the wasmi layer: We have provided the backtrace function of recording wasm execution for wasmi, and provided support for parity-wasm, pwasm-utils, and cargo-contract during wasm processing of the contract contains the function of the name section.
+Contract logging function: Use the function of ChainExtensions to realize the library for printing the log in the contract.
+In the current Pallet Contracts, when an error occurs in the execution of wasmi, and in the host_function call of Pallet Contracts during the execution of wasmi, it will be displayed as a ContractTrap error externally. In this situation, it is difficult for developers to locate the cause of the error. Only from this information, it is impossible to tell whether the problem is the contract itself, ink!, or Pallet Contracts. Therefore, the rich information that Europa v0.2 can provide allows developers to directly locate the cause of the problem.
+
+1.1 on Pallet Contracts layer
+During the contract debugging process, Europa believes that developers need:
+
+Informazioni dettagliate sugli errori: WASM registra le informazioni sugli errori durante l'intero processo di esecuzione, inclusi gli errori dell'esecutore WASM e gli errori della funzione host. Le informazioni di backtrace di wasmi verranno unificate con le informazioni di errore qui.
+Esecuzione nel processo di debug: le informazioni di modifica principali di Pallet Contracts, lo "stack di contratti" vengono utilizzate per registrare il processo di chiamata del contratto e qualsiasi informazione che possa aiutare il debug durante l'esecuzione di questo livello di contratto, come la situazione della chiamata la funzione host, il selettore e i parametri del contratto di chiamata, ecc.
+Pertanto, in risposta a tali esigenze, Europa ha apportato i seguenti progetti e modifiche:
+
+1.1.1 ricca di informazioni sugli errori
+1.errore sul livello esecutore wasm ：
+
+Europa ha progettato il nostro ep-sandboxper sostituire l'originale sp-sandboxutilizzato Pallet Contractse modificatoep_sandbox::Error
+
+use patract_wasmi::Error as WasmiError;
+pub enum Error {
+Module(WasmiError),
+OutOfBounds,
+Execution,
+WasmiExecution(WasmiError),
+}
+Module(WasmiError)trasporta le informazioni di errore originali del livello WASM e l' to_execution_resultin frame/contracts/src/wasm/runtime.rsviene convertito in Stringper generare un messaggio di errore.
+
+Europa proprio ep-sandboxha solo la stdversione (in quanto Europa ha rimosso tutte le parti wasm, non v'è alcuna necessità di ep-sandboxal supporto no-std), anche in futuro, ** ep-sandboxpuò essere sostituito con diversi esecutori wasm per supportare l'esecuzione di test di diversi esecutori wasm, e sostituito con esecutori wasm che supportano il debug e altre funzionalità. **
+
+Attualmente ep-sandboxutilizza una versione biforcuta di wasmicome esecutore, quindi l'errore che genera è WasmiError. Vedere il capitolo successivo per gli errori in wasmi.
+
+2.errore di funzioni_host:
+
+L'errore di esecuzione della funzione host causerà Trap e registrerà TrapReason. Nessuna modifica alla struttura dei dati, basta registrare.
+
+1.1.2 Esecuzione durante il debug
+La versione biforcuta Europa di Pallet Contractsha progettato un oggetto per registrare tutte le informazioni che possono aiutare il debug durante l'esecuzione del contratto:
+
+/// Record the contract execution context.
+pub struct NestedRuntime {
+	/// Current depth
+    depth: usize,
+	/// The current contract execute result
+	ext_result: ExecResult,
+	/// The value in sandbox successful result
+	sandbox_result_ok: Option<ReturnValue>,
+	/// Who call the current contract
+    caller: AccountId32,
+	/// The account of the current contract
+    self_account: Option<AccountId32>,
+	/// The input selector
+    selector: Option<HexVec>,
+	/// The input arguments
+    args: Option<HexVec>,
+	/// The value in call or the endowment in instantiate
+    value: u128,
+	/// The gas limit when this contract is called
+    gas_limit: Gas,
+	/// The gas left when this contract return
+    gas_left: Gas,
+	/// The host function call stack
+    env_trace: EnvTraceList,
+	/// The error in wasm
+    wasm_error: Option<WasmErrorWrapper>,
+	/// The trap in host function execution
+    trap_reason: Option<TrapReason>,
+	/// Nested contract execution context
+    nest: Vec<NestedRuntime>,
+}
+Nel modello di Pallet Contracts, un contratto che chiama un altro contratto è nel modello "stack di contratti", quindi NestedRuntimeterrà traccia del processo di esecuzione dell'intero stack di contratti e utilizzerà la proprietà di nestper salvare un elenco di NestedRuntimeper rappresentare altri contratti il ​​contratto chiamato.
+
+In the process of executing a contract by Pallet Contracts, Europa records the relevant information in the execution process in the structure of NestedRuntime in the form of a bypass, and will print the NestedRuntime to the log (show the case later) in a certain format after the contract call ends. Contract developers can analyze the information printed by NestedRuntime to obtain various detailed information during the execution of the contract, which can be used in various situations:
+
+help to locate where the error occurs, including the following situations:
+Pallet Contracts layer
+ink! layer
+The specific position in the contract layer
+Locate which level of the contract is when a contract calling another contract
+Analyze the information during the execution of the contract at this timing:
+Analyze the consumption of gas execution
+Analyze the call of get_storage and set_storage, help reconstruct the contract code and analyze the demand of rent
+According to selector, args and value, analyze and locate whether the transaction parameters of the third-party SDK are legal.
+Analyze the execution path of the contract and adjust the contract based on the nest information and combined with the seal_call information.
+etc.
+The process of recording Pallet Contracts executing contract to NestEdRuntime is relatively fine-grained. The process of logging the information of the execution contract of Pallet Contracts to NestEdRuntime is relatively fine-grained. Take seal_call in define_env! as an example:
+
+pub struct SealCall {
+    callee: Option<HexVec>,
+    gas: u64,
+    value: Option<u128>,
+    input: Option<HexVec>,
+    output: Option<HexVec>,
+}
+Gli attributi sono fondamentalmente Option<>. Ad esempio, prima di chiamare il contratto, inputverrà impostato su Somee il valore restituito verrà impostato dopo che il contratto chiamante è normale. Se c'è un errore nel contratto di chiamata, outputrimarrà None. Pertanto, se inputè Someed outputè None, significa che c'è un problema con il contratto chiamato durante il processo di chiamata del contratto.
+
+Le informazioni correnti di NestedRuntimevengono stampate solo nel registro. In futuro, NestedRuntimeverrà archiviato localmente e fornirà l'RPC corrispondente per l'accesso esterno . Pertanto, in futuro, le applicazioni di terze parti possono essere ottenute NestedRuntimeper ulteriori elaborazioni. Ad esempio, nel nostro Redspot, un plug-in può essere progettato per generare una chiamata di contratto un'altra topologia di contratto basata sulle informazioni di NestedRuntimee un percorso di chiamata di contratto visivo può essere generato sull'interfaccia del portafoglio web, ecc.
+
+1.2 sullo wasmistrato
+Abbiamo biforcato wasmi e l'abbiamo integrato in ep-sandbox. Biforcuta Pallet Contractspossono ottenere le informazioni di errore di biforcuta wasmiattraverso ep-sandbox, incluse le informazioni di backtrace wasmi.
+
+Se è necessario che make wasmipossa conservare le informazioni di backtrace durante l'esecuzione, è necessario disporre delle seguenti funzioni:
+
+La sezione "sezione nome" è richiesta nel file sorgente WASM (vedere la sezione specifica del nome) )
+Conserva le informazioni sulla "sezione nome" durante il processo di verifica del contratto Pallet Contractse mantieni una relazione corrispondente con il file di origine wasm dopo il processo.
+Durante l'esecuzione di wasmi, lo stack di esecuzione deve essere conservato con le informazioni chiave delle funzioni. Allo stesso tempo, la "sezione nome" deve essere analizzata e corrispondere alle informazioni sulla funzione riservate dallo wasmistack di esecuzione.
+The changes to 2 involve cargo-build and parity-wasm, while the changes to 1 and 3 are mainly in the forked wasmi, and a small part involves pwasm-utils.
+
+1.2.1 Submitted WASM files contains debug info from "name section"
+PR: paritytech/cargo-contract#131
+Source: patractlabs/cargo-contract
+Frist of all, we have to submit wasm files which contain the debug info that the on-chain side can parse and get the panic errors.
+
+Currently, parity/cargo-contract trims debug info while building contracts, we can get them back with the following steps.
+
+1. Keep name section from striping
+The name section has been striped at cargo-contract/cmd/build.rs#L247.
+
+2. Keep debug info from wasm-opt
+cargo-contractpassa debug_info: falsea wasm-opt, quindi le informazioni di debug saranno sempre ottimizzate durante l'esecuzione wasm-opt, il codice è qui: cargo-contract / cmd / build.rs # L267 .
+
+3. Conserva le informazioni di debug da rustc
+cargo-contractesegue il realease build per impostazione predefinita, qui possiamo abilitare il debug build o modificare il flag a livello di opt di rustcper mantenere le informazioni di debug su cargo-contract / cmd / build.rs # L137 .
+
+1.2.2 Salvare le informazioni di debug dallo scraper di Pallet Contracts
+Cosa succede nel Pallet Contractsmomento in cui chiamiamo un contratto?
+
+Ottieni il file binario WASM dall'archivio
+Iniettare il contatore del gas al contratto
+Iniettare l'altezza dello stack nel contratto
+Metti il ​​contratto in sp-sandboxed eseguilo
+Ottieni il risultato da sp-sandboxe restituiscici il risultato
+1. Memorizza la sezione del nome durante la creazione del modulo WASM
+PR: https://github.com/paritytech/parity-wasm/pull/300
+Pallet Contracts crea i moduli WASM dalla memoria e rilascia le sezioni personalizzate per impostazione predefinita, qui dovremmo recuperarle.
+
+2. Aggiornare gli indici delle funzioni nella sezione del nome durante l'iniezione del contatore del gas
+PR: paritytech / wasm-utils # 146
+Fonte: patractlabs / wasm-utils # 146
+Pallet Contractsriordina le indcies delle funzioni nei nostri contratti WASM dopo aver iniettato gas memter nei contratti WASM a paritytech / wasm-utils / gas / mod.rs # L467 , questo rovinerà le funzioni indecies nella sezione del nome che non possiamo ottenere le backtrace corrette .
+
+3. Impelment WASM backtrace a WASMI
+Fonte: patractlabs / wasmi
+Ricorda gli ultimi due passaggi nel capitolo 2, la parte centrale dell'abilitazione di WASM backtrace Pallet Contractè rendere il wasmisupporto backtrace.
+
+Il processo di esecuzione di una funzione nell'interprete di wasmi è come:
+
+Richiama la funzione di destinazione
+chiama e chiama e chiama di nuovo
+Panico se il processo si interrompe.
+Aggiungi il campo delle informazioni sulla funzione a FuncRef
+FuncRefè l'interprete wasmi "funzione" che chiama direttamente, quindi abbiamo bisogno di incorporare le informazioni di debug in FuncRefcome la prima volta, fonte in wasmi / func.rs # L26 .
+
+//! patractlabs/wasmi/src/func.rs#L26
+/// ...
+pub struct FuncRef {
+    /// ...
+    /// Function name and index for debug
+    info: Option<(usize, String)>,
+}
+Imposta le informazioni sulla funzione utilizzando la sezione del nome durante l'analisi dei moduli WASM
+Abbiamo già letto il infocampo FuncRef, ora dobbiamo riempire questo campo usando la sezione del nome durante l'analisi dei moduli WASM, fonte in wasmi / module # L343 .
+
+//! wasmi/src/module.rs#L343
+// ...
+if has_name_section {
+     if let Some(name) = function_names.get((index + import_count) as u32) {
+         func_instance = func_instance.set_info(index, name.to_string());
+     } else {
+         func_instance = func_instance.set_info(index, "<unknown>".to_string());
+     }
+}
+// ...
+Fai il supporto dell'interprete trace
+Tuttavia, non abbiamo bisogno di ottenere informazioni su tutte le funzioni tranne le serie in preda al panico nello stack dell'interprete, fonte su wasmi / runner.rs # L1491 .
+
+//! wasmi/src/runner.rs#L1491
+/// Get the functions of current the stack
+pub fn trace(&self) -> Vec<Option<&(usize, String)>> {
+    self.buf.iter().map(|f| f.info()).collect::<Vec<_>>()
+}
+Raccogli le informazioni di debug quando il programma si interrompe
+Basta raccogliere i backtrace quando richiamiamo la funzione non riuscita, fonte in wasmi / func.rs # L170 .
+
+//! wasmi/src/func.rs#L170
+// ...
+
+let res = interpreter.start_execution(externals);
+if let Err(trap) = res {
+let mut stack = interpreter
+    .trace()
+    .iter()
+    .map(|n| {
+        if let Some(info) = n {
+            format!("{:#}[{}]", rustc_demangle::demangle(&info.1), info.0)
+        } else {
+            "<unknown>".to_string()
+        }
+    })
+    .collect::<Vec<_>>();
+
+// Append the panicing trap
+stack.append(&mut trap.wasm_trace().clone());
+stack.reverse();
+
+// Embed this info into the trap
+Err(trap.set_wasm_trace(stack))
+
+// ...
+1.3 Funzioni del registro dei contratti
+Nel processo di debug del contratto, è necessario conoscere l'esecuzione interna del contratto e i dati intermedi. Nell'attuale mancanza di condizioni di debug (come l'utilizzo di gdb per il debug), la stampa dei log è il modo più conveniente. Come accennato nella proposta Europa v0.2, l'attuale Pallet Contractse ink!già supporta format!+ seal_printlnper formattare e stampare stringhe, ma questa modalità ha due difetti:
+
+Tutti i log di seal_printlnstampati sul lato nodo sono a target: runtimelivello DEBUG, ma quando si sviluppano contratti complessi, verranno stampati molti log. Se non è possibile filtrare targete registrare il livello, il processo di sviluppo sarà pieno di interferenze da informazioni irrilevanti.
+Lo sviluppatore del contratto ha scritto seal_printlnquando necessario durante il processo di sviluppo, ma tutto seal_printlndeve essere cancellato quando il contratto viene rilasciato. Sebbene lo sviluppatore del contratto possa incapsulare una funzione compilata in modo condizionale per controllarla, è più conveniente se una libreria di strumenti fornisce già tale funzione.
+Pertanto, Europa fornisce una libreria di log patractlabs / ink-log che imita le logcrete di Rust per risolvere i problemi di cui sopra. Il suo utilizzo è lo stesso di quello di Rust. logè completamente coerente, il che riduce i costi di apprendimento degli sviluppatori.
+
+Il ink-logè generalmente implementato dal ChainExtensiondi Pallet Contracts, il concordato function_idè 0xfeffff00, e il messaggio viene trasmesso nella memoria wasm attraverso la struttura LoggerExt. Pertanto questa libreria è suddivisa nelle seguenti due parti:
+
+ink_log: In the ink-log/contracts directory, provide info!, debug!, warn!, error!, trace!, same as Rust's log library in the same macro, and the call method of the macro is also the same. These macros are packaged implementations of seal_chain_extensions on the ink! side, and are tool library for contract developers. For example, after this library is introduced in the contract Cargo.toml, the log can be printed as follows:
+
+In Cargo.toml:
+
+[dependencies]
+ink_log = { version = "0.1", git = "https://github.com/patractlabs/ink-log", default-features = false, features = ["ink-log-chain-extensions"] }
+   
+[features]
+default = ["std"]
+std = [
+	# ...
+	"ink_log/std"
+]
+In the contract, you can use the following methods to print logs in the node:
+
+ink_log::info!(target: "flipper-contract", "latest value is: {}", self.value);
+runtime_log: Nella ink-log/runtimedirectory, questa libreria si basa sui contenuti del function_ide LoggerExtstrutture passato da ChainExtensionschiamare i log corrispondenti sotto debuga frame_supportstampare. È una libreria di implementazione ink_logpreparata per gli sviluppatori della catena. ** Ad esempio, gli sviluppatori di catene possono usarlo da soli ChainExtensions:
+
+In Cargo.toml：
+
+[dependencies]
+runtime_log = { version = "0.1", git = "https://github.com/patractlabs/ink-log", default-features = false }
+
+[features]
+default = ["std"]
+std = [
+	# ...
+	"runtime_log/std"
+]
+Nell'implementazione di ChainExtensions：
+
+pub struct CustomExt;
+impl ChainExtension for CustomExt {
+	fn call<E: Ext>(func_id: u32, env: Environment<E, InitState>) -> Result<RetVal, DispatchError>
+	where
+		<E::T as SysConfig>::AccountId: UncheckedFrom<<E::T as SysConfig>::Hash> + AsRef<[u8]>,
+	{
+        match func_id {
+            ... => {/* other ChainExtension */ }
+            0xfeffff00 => {
+                // TODO add other libs
+        		runtime_log::logger_ext!(func_id, env);
+		        // or use
+                // LoggerExt::call::<E>(func_id, env)
+                Ok(RetVal::Converging(0))
+            }
+        }	
+	}
+}
+** ink_logcorrisponde a runtime_log, quindi se gli sviluppatori di contratti devono utilizzare ink_log, devono prestare attenzione alla catena corrispondente al contratto di debug che deve essere implementato runtime_log. **
+
+D'altra parte, dopo che gli sviluppatori del contratto hanno introdotto ink_log, devono prestare attenzione features = ["ink-log-chain-extensions"], ink_logchiameranno seal_chain_extensionsper interagire con la catena solo quando questa funzione è abilitata. Senza questa funzionalità, noopverrà utilizzato per saltare il processo di stampa del contratto.
+
+Pertanto, gli sviluppatori di contratti possono controllare il contratto per stampare i registri nell'ambiente di debug e nell'ambiente di produzione tramite le funzionalità. Il contratto compilato nell'ambiente di debug apre la "ink-log-chain-extensions"funzionalità e il contratto compilato nell'ambiente di produzione rimuove questa funzionalità.
+
+2. Cosa può fare Europa nella v0.2
+2.1 Costruisci
+Per gli sviluppatori di contratto, è necessario preparare Europae cargo-contractstrumenti.
+
+2.1.1 Europa
+The building process for this project is as same as Substrate.
+
+When building finished, current executable file in target directory is named Europa.
+
+git clone --recurse-submodules https://github.com/patractlabs/Europa.git
+2.1.2 Cargo-contract
+Se vuoi vedere il backtrace eseguito da WASM durante il funzionamento di Europa, devi usare la cargo-contractversione da noi fornita. Perché l'attuale contratto cargo paritytech utilizza il livello di ottimizzazione più alto durante la compilazione del contratto e scarta la parte "sezione nome" in WASM. Come accennato in precedenza, se è necessario stampare le informazioni sullo stack di chiamate nel contratto di esecuzione wasmi, il file del contratto deve contenere la parte "sezione nome", quindi l'uso del cargo-contractfornito da paritytech non può soddisfare i requisiti. Abbiamo completato questa funzione nel nostro repo biforcuto. D'altra parte, pensiamo che la funzione di "sezione nome" in WASM potrebbe non essere necessaria solo a Europa, quindi abbiamo inviato il pr # 131 [Abilita le informazioni di debug al magazzino di origine con flag nel comando build] fornisce questa caratteristica.
+
+Prima che questo PR venga unito, attualmente è possibile utilizzare solo la cargo-contractversione fornita da noi (Patract Labs):
+
+cargo install --git https://github.com/patractlabs/cargo-contract --branch cmd/debug --force
+Se non si desidera che questa versione di cargo-contractcopra la versione rilasciata da paritytech, si consiglia di compilare localmente e utilizzare cargo-contractdirettamente il prodotto compilato :
+
+git clone https://github.com/patractlabs/cargo-contract --branch cmd/debug
+cd cargo-contract
+cargo build --release
+Nota: l'esecuzione del cargo-contract buildcomando richiede che la default toolchaincatena di build rust sia nightly, altrimenti puoi solo usare cargo +nightly contract build, ma usando cargoper chiamare cargo-contractdeve essere eseguito cargo installinstalla o sovrascrive il prodotto compilato nella ~/.cargo/bindirectory e non può coesistere con paritytech'scargo-contract
+
+Eseguire:
+
+cargo-contract build --help
+# or
+cargo +nightly contract build --help
+Se puoi vedere:
+
+FLAGS:
+    -d, --debug      
+            Emits debug info into wasm file
+Significa che stai utilizzando il cargo-contractfornito da Patract Labs. Se vuoi vedere il backtrace del crash di esecuzione del contratto WASM durante l'utilizzo di Europa, devi aggiungere il --debugcomando durante la compilazione del contratto.
+
+L'utilizzo del --debugcomando genererà un altro file oltre al normale file nella target/inkdirectory del contratto originariamente compilato, che termina con *.src.wasm. Questo *.src.wasmfile è il file del contratto WASM contenente la parte "sezione nome".
+
+** Se è necessario utilizzare Europa per il test, il contratto distribuito a Europa deve utilizzare questo *.src.wasmfile invece del *.wasmfile originariamente generato . **
+
+2.2 Esempio
+Possiamo utilizzare un semplice caso e altri casi che abbiamo riscontrato per verificare l'affidabilità dei problemi di posizionamento di Europa.
+
+Nel seguente contesto, i metodi di avvio di Europa sono tutti utilizzati da:
+
+$ Europa --tmp -lruntime=debug
+Ogni volta che Europa viene avviato in questo modo, vengono creati nuovi dati. Se si desidera conservare i dati di esecuzione di Europa, fare riferimento al README di Europa o al [Report] di Europa v0.1 (https://polkadot.polkassembly.io/post/ 166), è possibile ottenere ulteriori informazioni sull'introduzione dei comandi.
+
+2.2.1 Caso 1 ： Caso semplice
+Per esempio, modifichiamo il contratto esempio ink/example/erc20in inchiostro! progetto come segue:
+
+#[ink(message)]
+pub fn transfer(&mut self, to: AccountId, value: Balance) -> Result<()> {
+    let from = self.env().caller();
+    self.transfer_from_to(from, to, value)?;
+    panic!("123");
+    Ok(())
+}
+WASM, corrisponde al codice dopo l'espansione della macro del file originale, quindi se vuoi confrontare gli errori dello stack di chiamate, devi espandere la macro del contratto originale:
+
+cargo install expand
+cd ink/example/erc20
+cargo expand > tmp.rs
+Dopo aver letto il tmp.rsfile, possiamo sapere che WASM deve essere eseguito quando esegue la transferfunzione:
+
+fn call() -> u32 
+-> <Erc20 as ::ink_lang::DispatchUsingMode>::dispatch_using_mode(...)
+-> <<Erc20 as ::ink_lang::ConstructorDispatcher>::Type as ::ink_lang::Execute>::execute(..)  # compile selector at here
+-> ::ink_lang::execute_message_mut
+-> move |state: &mut Erc20| { ... } # a closure
+-> <__ink_Msg<[(); 2644567034usize]> as ::ink_lang::MessageMut>::CALLABLE
+-> transfer
+Pertanto, se il panicdi transfersi incontra durante la chiamata contratto, il backtrace di wasm dovrebbe essere simile a questo.
+
+Per prima cosa iniziamo Europa:
+
+$ Europa --tmp -lruntime=debug
+Quindi distribuiamo questo erc20 e chiamiamo il trasferimento da eseguire.
+
+Possiamo utilizzare Polkadot/Substrate Portalo utilizzare RedSpot per verificare questo processo. Supponiamo di utilizzare RedSpotper eseguire una transferchiamata di questo contratto ERC20 sbagliato. Si prega di notare che il --debugsottocomando deve essere aggiunto nel processo di compilazione del contratto:
+
+$ npx redspot-new erc20
+$ cd erc20/contracts
+# add panic in `transfer` function as abrove
+$ vim lib.rs 
+# notice must add --debug when compile contract
+# due current cargo-contract is not paritytech, we need to copy compile product into `artifacts` directory. RedSpot would support Europa and PatractLabs's cargo-contract in next version.
+$ cargo +nightly contract build --debug 
+$ mkdir ../artifacts
+# notice must cp erc20.src.wasm, not erc20.wasm
+$ cp ./target/ink/erc20.src.wasm ../artifacts  
+# notice must rename metadata.json to erc20.json
+$ cp ./target/ink/metadata.json ../artifacts/erc20.json 
+$ cd ../
+# enter redspot console, use `--no-compile` to deny recompile contract
+$ npx redspot console --no-compile  
+# in redspot console
+Welcome to Node.js v12.16.1.Type ".help" for more information.
+> 
+> var factory = await patract.getContractFactory('erc20')
+# do following command could deploy the erc20 contract
+> var contract = await factory.deployed('new', '1000000', {value: 20000000000, salt:1})
+# do a transfer call directly
+> await contract.transfer("5GcTYx4dPTQfi4udKPvE4VKmbooV7zY6hNYVF9JXHJL4knNF", 100)
+Quindi nel registro di Europa, puoi vedere:
+
+1: NestedRuntime {
+	ext_result: [failed] ExecError { error: DispatchError::Module {index:5, error:17, message: Some("ContractTrapped"), orign: ErrorOrigin::Caller }}
+    caller: d43593c715fdd31c61141abd04a99fd6822...(5GrwvaEF...),
+    self_account: b6484f58b7b939e93fff7dc10a654af7e.... (5GBi41bY...),
+    selector: 0xfae3a09d,
+    args: 0x1cbd2d43530a44705ad088af313e18f80b5....,
+    value: 0,
+    gas_limit: 409568000000,
+    gas_left: 369902872067,
+    env_trace: [
+        seal_value_transferred(Some(0x00000000000000000000000000000000)),
+        seal_input(Some(0xfae3a09d1cbd.....)),
+        seal_get_storage((Some(0x0100000000000....), Some(0x010000000100000001000000))),
+        # ...
+        seal_caller(Some(0xd43593c715fdd31c61141abd...)),
+        seal_hash_blake256((Some(0x696e6b20686173....), Some(0x0873b31b7a3cf....))),
+      	# ...  
+        seal_deposit_event((Some([0x45726332303a....00000000000]), Some(0x000..))),
+    ],
+	trap_reason: TrapReason::SupervisorError(DispatchError::Module { index: 5, error: 17, message: Some("ContractTrapped") }),
+    wasm_error: Error::WasmiExecution(Trap(Trap { kind: Unreachable }))
+        wasm backtrace: 
+        |  core::panicking::panic[28]
+        |  erc20::erc20::_::<impl erc20::erc20::Erc20>::transfer[1697]
+        |  <erc20::erc20::_::__ink_Msg<[(); 2644567034]> as ink_lang::traits::MessageMut>::CALLABLE::{{closure}}[611]
+        |  core::ops::function::FnOnce::call_once[610]
+        |  <erc20::erc20::_::_::__ink_MessageDispatchEnum as ink_lang::dispatcher::Execute>::execute::{{closure}}[1675]
+        |  ink_lang::dispatcher::execute_message_mut[1674]
+        |  <erc20::erc20::_::_::__ink_MessageDispatchEnum as ink_lang::dispatcher::Execute>::execute[1692]
+        |  erc20::erc20::_::<impl ink_lang::contract::DispatchUsingMode for erc20::erc20::Erc20>::dispatch_using_mode[1690]
+        |  call[1691]
+        ╰─><unknown>[2387]
+    ,
+    nest: [],
+}
+Cerchiamo di spiegare le informazioni stampate sopra:
+
+ext_result: indica che questa chiamata di contratto viene visualizzata come riuscita o non riuscita:
+
+[success]: indica la corretta esecuzione del presente contratto (Nota: la corretta esecuzione del contratto non significa la corretta esecuzione della logica di business del contratto stesso. Potrebbe esserci un errore di ritorno nella ink!logica di business del contratto stesso, come in caso 3 nel testo seguente.) E il ExecResultValue {flag:0, data: 0x...}seguito da [success]indica il valore restituito dopo l'esecuzione del contratto.
+[failed]: indica che l'esecuzione di questo contratto non è riuscita e il ExecError {.. }seguito da [failed]indica la causa di questo errore. La ragione di ciò è il valore registrato nella eventcatena, che è il valore definito in decl_error!di Pallet Contracts.
+1: NestedRuntime & nest: Le informazioni sul contratto che rappresentano le informazioni di stampa correnti si trovano nel primo livello dello stack di chiamate del contratto. Se il contratto corrente chiama un altro contratto, apparirà nella matrice del nestcampo. 2: NestedRuntimee 1: NestedRuntimeha la stessa struttura. Tra questi, 2indica che il contratto chiamato si trova nel secondo livello dello stack di chiamate del contratto. Se vengono richiamati più contratti tra i contratti nel contratto corrente, ce ne saranno diversi NestedRuntimenell'array di nest. Se ci sono altre chiamate di contratto nel contratto di secondo livello, lo stesso vale.
+
+Ad esempio, se ci sono contratti A, B, C, se è la seguente situazione:
+
+Dopo che A ha chiamato B, torna ad A per continuare l'esecuzione, quindi chiama il contratto C.
+
+|A|
+| |->|B|
+| |<-
+| |->|C|
+| |<-
+Quindi produrrà una stampa del registro simile alla seguente:
+
+1: NestedRuntime {
+ self_account: A,
+ nest:[
+     2: NestedRuntime {
+         self_account: B,
+         nest:[],
+     },
+     2: NestedRuntime {
+         self_account: C,
+         nest:[],
+     }
+ ]
+}
+Dopo che A chiama B, B chiama di nuovo il contratto C e infine torna da A
+
+|A|
+| |->|B|
+| |  | |->|C|
+| |  | |<-
+| |<-
+Quindi produrrà una stampa del registro simile alla seguente:
+
+1: NestedRuntime {
+ self_account: A,
+ nest:[
+     2: NestedRuntime {
+         self_account: B,
+         nest:[
+         	3: NestedRuntime {
+                self_account: C,
+                nest:[],
+            }
+         ],
+     }  
+ ]
+}
+caller: chi è il chiamante del contratto in corso. Se il contratto chiama il contratto, il valore del contratto chiamato è l'indirizzo del contratto di livello superiore.
+
+self_account: rappresenta l'indirizzo del contratto in corso stesso.
+
+selector& args& value: Rappresenta i selectorparametri e passati quando si chiama il contratto corrente. Queste informazioni possono individuare rapidamente se il metodo del contratto chiamante è corretto .
+
+gas_limit& gas_left: Rappresenta il gas_limitpassaggio al momento della chiamata del contratto e il gas rimanente dopo l' esecuzione di questo livello . Nota qui che si gas_leftriferisce al gas rimanente dopo l'esecuzione di questo strato di contratto, quindi ** Nel contratto di chiamata del contratto, il gas consumato da ogni strato di contratto può essere determinato attraverso gas_left, non solo Ottieni il consumo dopo l'esecuzione dell'intero contrarre.
+
+env_trace: Indica che durante l'esecuzione del livello corrente del contratto, ogni volta che host_function viene chiamata nell'esecuzione WASM del contratto, qui verrà aggiunto un record all'elenco. Poiché tutti host_functions e la definizioni define_env!del Pallet Contractsmodulo sono correlati, quindi tracciando env_tracepuò tracciare il processo di interazione con Pallet Contractsdurante l'esecuzione del contratto wasm corrente.
+
+Ad esempio, se la seguente cosa appare in env_trace:
+
+seal_call: Significa che c'è una situazione di contratto a chiamata nel contratto corrente. Secondo l'ordine in cui seal_callappare env_trace, può corrispondere nesta calcolare lo stato prima e dopo che il contratto chiama il contratto.
+seal_get_storage& seal_set_storage: Significa che i dati di lettura e scrittura sono avvenuti nel contratto. Attraverso queste due interfacce è possibile intercettare e contare i dati letti e scritti durante l'esecuzione del contratto corrente, e la dimensione dei dati calcolata da ** seal_set_storagepuò essere utilizzata anche per dedurre la dimensione di archiviazione richiesta da rent. **
+seal_deposit_event: indica che l'evento è stampato nel contratto. Qui puoi intercettare il contenuto di ogni evento separatamente, invece di ottenere un evento unificato alla fine. E il testo seguente utilizzerà un esempio per far emergere che Europa può individuare rapidamente il bug nel file host_function.
+D'altra parte, le statistiche di env_tracesono relativamente a grana fine . Ad esempio, se sono presenti più errori possibili host_function, quando si verifica un errore, tutte le informazioni prima dell'errore verranno conservate, in modo che possano essere localizzate nel punto in cui si è verificato il problema durante l'esecuzione di host_function.
+
+E se si verifica un errore host_functionche causa la fine dell'esecuzione del contratto, env_traceregistra l'ultima host_functionchiamata di errore , in modo da poter individuare direttamente quale ha host_functioncausato l'eccezione di esecuzione del contratto.
+
+trap_reason: Secondo la definizione di TrapReasonin Pallet Contracts, trap_reasonpuò essere suddiviso in 2 categorie:
+
+Return& Termination& Restoration: indica che l'uscita del contratto è la progettazione di Pallet Contracts, non un errore interno. Questo tipo di trap indica che il contratto viene eseguito normalmente e non è un errore.
+SupervisorError: Indica che si è verificato un errore durante l'esecuzione del contratto che chiama host_function.
+Pertanto, l'attuale progetto di stampa del registro Europa è progettato per registrare ogni volta che trap_reasonappare. D'altra parte, trap_reasonpotrebbe non apparire sempre durante l'esecuzione del contratto. Combinando il design di Pallet Contractse ink!, c'è un caso in cui l'esecuzione con successo del contratto o l'esecuzione non riuscita nel ink!livello non si genera trap_reason. Pertanto, oltre alla registrazione trap_reason, Europa registra anche ** i risultati restituiti dall'esecutore WASM dopo l'esecuzione, che vengono registrati con sandbox_result_ok. **
+
+sandbox_result_ok: Il valore di sandbox_result_okrappresenta il risultato del contratto dopo l'esecuzione dell'esecutore WASM. Questo valore potrebbe essere stato registrato come sandbox_result, comprese le condizioni corrette e non corrette. Tuttavia, a causa dei limiti di Rust e in combinazione con la logica di business di Pallet Contracts, solo il risultato di sandbox_resultviene mantenuto come Okqui. ** Per la stampa del registro, Europa è progettato per stampare sandbox_result_oksolo quando trap_reason è il primo caso, come informazione per aiutare a giudicare l'esecuzione del contratto. **
+
+sandbox_result_okè il risultatoinvoke dell'esecutore WASM dopo la chiamata Dopo l'elaborazione di to_execution_result, se non c'è trap_reason, il risultato di Ok(..)[scartato] (https://github.com/paritytech/substrate/blob/712085115cdef4a79a66747338c920d6ba4e479f / frame / contract / src / wasm / runtime. rs # L366-L368). Ma in realtà ci sono due situazioni qui:
+
+Si è verificato un errore in ink!: Secondo l'implementazione di ink!, prima di chiamare le funzioni avvolte dal contratto #[ink(message)]e #[ink(constructor)], l'input Il processo di decodifica e abbinamento selector. Se si verifica un errore durante questo processo, il contratto restituirà il codice di erroreDispatchError . Ma per l'esecutore WASM, il codice WASM viene eseguito normalmente, quindi verrà restituito il risultato, incluso questo codice di errore. ** Questo processo di esecuzione del contratto è una situazione di errore. **
+Il valore di ritorno di #[ink(message)]è definito come (): Secondo l'implementazione di ink!, se il tipo di valore di ritorno è (), seal_reasonnon verrà chiamato, quindi non Contiene trap_reason. ** Questo processo di esecuzione del contratto è una situazione corretta. **
+Poiché ink!è solo un'implementazione del contratto che viene eseguita Pallet Contracts, altre implementazioni possono avere regole diverse, quindi attualmente sandbox_result_okviene utilizzato solo per aiutare a determinare l'esecuzione del ink!contratto, il valore è  ReturnValue. Tra questi, se la <num>parte di ReturnValue::Value(<num>)log non è 0, significa che potrebbe esserci un errore nell'esecuzione di ink!. È possibile utilizzare ink!per DispatchErrorIl codice di errore determina l'errore.
+
+wasm_error: indica il backtrace quando WASM esegue un errore. Questa parte verrà stampata solo quando ext_resultè failed.
+
+Nell'esempio sopra, poiché l'esecuzione di transfersi attiverà panic, puoi vedere che la causa dell'errore qui è WasmiExecution(Trap(Trap {kind: Unreachable })), indicando che questa volta l'errore è dovuto all'esecuzione La situazione del Unreacbleprocesso del contratto è causata e anche le informazioni di backtrace di seguito descrive molto accuratamente lo stack di chiamate di esecuzione della funzione quando si verifica un errore dopo l'espansione della macro del contratto discussa sopra. Il seguente processo di chiamata può essere trovato chiaramente dal backtrace.
+
+call -> dispatch_using_mode -> ... -> transfer -> panic 
+Questo processo è coerente con le informazioni originali del contratto.
+
+2.2.2 Caso 2 ：ContractTrapcausato dall'individuazione di argomenti duplicati
+Qualche tempo fa, noi (Patract Labs) abbiamo segnalato un bug a ink!, vedere problema: "Quando viene impostato il valore '0' nell'evento dei contratti, può causare un Error::ContractTrappedpanico nel contratto # 589" . È molto difficile individuare questo errore prima che Europa abbia sviluppato la funzione pertinente. Grazie @athei ha individuato l'errore . Qui riproduciamo questo errore e utilizziamo il registro di Europa per analizzare e individuare rapidamente il luogo in cui compare il bug:
+
+checkout ink!per impegnarsi8e8fe09565ca6d2fad7701d68ff13f12deda7eed
+
+cd ink
+git checkout 8e8fe09565ca6d2fad7701d68ff13f12deda7eed -b tmp
+Vai a ink/examples/erc20/lib.rs:L90al cambiamento valueper 0_u128aTransfer
+
+#[ink(constructor)]
+pub fn new(initial_supply: Balance) -> Self {
+	//...
+    Self::env().emit_event(Transfer {
+        from: None,
+        to: Some(caller),
+        // change this from `initial_supply` to `0_u128`
+        value: 0_u128.into() // initial_supply,
+    });
+    instance
+}
+Esegui cargo +nightly contract build --debugper compilare il contratto
+
+Usa RedSpot o Polkadot/Substrate Portalper distribuire questo contratto (nota che devi usare il file erc20.src.wasm)
+
+Dovresti incontrare DuplicateTopicsnella fase di distribuzione (prima che questo bug venga corretto, l'errore segnalato è ContractTrap) e nel registro di Europa mostrerà:
+
+1: NestedRuntime {
+    #...
+    env_trace: [
+        seal_input(Some(0xd183512b0)),
+		#...    
+		seal_deposit_event((Some([0x45726332303a3a5472616e736....]), None)),
+    ],
+    trap_reason: TrapReason::SupervisorError(DispatchError::Module { index: 5, error: 23, message: Some("DuplicateTopics") }),
+    wasm_error: Error::WasmiExecution(Trap(Trap { kind: Host(DummyHostError) }))
+    	wasm backtrace: 
+    	|  ink_env::engine::on_chain::ext::deposit_event[1623]
+    	|  ink_env::engine::on_chain::impls::<impl ink_env::backend::TypedEnvBackend for ink_env::engine::on_chain::EnvInstance>::emit_event[1564]
+    	|  ink_env::api::emit_event::{{closure}}[1563]
+    	|  <ink_env::engine::on_chain::EnvInstance as ink_env::engine::OnInstance>::on_instance[1562]
+    	|  ink_env::api::emit_event[1561]
+    	|  erc20::erc20::_::<impl ink_lang::events::EmitEvent<erc20::erc20::Erc20> for ink_lang::env_access::EnvAccess<<erc20::erc20::Erc20 as ink_lang::env_access::ContractEnv>::Env>>::emit_event[1685]
+# ...
+# ...
+    	|  deploy[1691]
+    	╰─><unknown>[2385]
+    ,
+    nest: [],
+}
+Puoi vedere dal registro sopra:
+
+L'ultimo record di env_traceè seal_deposit_eventinvece di seal_return(quando il contratto viene eseguito correttamente, l'ultimo record deve essere seal_return)
+Il secondo parametro di seal_deposit_eventè Noneinvece di un valore esistente, che indica che la funzione host_ di seal_deposit_eventnon è stata eseguita, ma si è verificato un errore durante l'esecuzione (vedere la dipendenza biforcuta di Europa) Vedere la [implementazione corrispondente] (https: // github. com / patractlabs / substrate / blob / 3624deb47cabe6f6cd44ec2c49c6ae5a29fd2198 / frame / contract / src / wasm / runtime.rs # L1399) per il codice sorgente della versione di Pallet Contracts.
+Combined with the error stack of wasm backtrace, we can intuitively see that the top call stack of backtrace is deposit_event.
+Therefore, combining the above information, we can directly infer that the host_function of seal_deposit_event has an exception during the execution. (Before the submission of Pallet Contractspull#7762, we recorded the error message in host_function. After the merge, we used trap_reason unified error message.)
+
+2.2.3 Case 3: When error is caused by the chain using type Balance=u64 instead of type Balance=u128
+Se la catena utilizza la definizione di Balance=u64e la definizione di Balancenella catena è sconosciuta ink!(la definizione predefinita di Balance è u128). Pertanto, quando si usa u128definire Balance's ink!come dipendenza compilato contratto, durante l'esecuzione su una catena in cui Balanceè definito come u64, farà sì che il Pallet Contractsmodulo di valori di trasferimento al contratto, il contratto riguarda la internamente valuedi u64un errore di decodifica u128.
+
+Prendi l'esempio del contratto di erc20 come esempio, dopo aver espanso la macro del contratto, puoi vedere:
+
+Quando si verifica un errore nella dispatch_using_modefase di decodifica input, il contratto ritorna con ::ink_lang::DispatchError::CouldNotReadInput, ma il design del modello Pallet Contractsritiene che l'esecuzione del contratto WASM non sia anormale.
+Nella chiamata di call, dal deny_paymentviene controllato prima della chiamata dispatch_using_modee se viene restituito un errore durante il controllo deny_payment, sarà direttamente panic.
+Pertanto, in questo caso, il contratto per la distribuzione ( Instantiate) ERC20 verrà eseguito normalmente e qualsiasi metodo di ERC20 come transferverrà chiamato con ContractTrap.
+
+Diamo un'occhiata a queste due situazioni separatamente:
+
+instantiate palcoscenico:
+
+1: NestedRuntime {
+	ext_result: [success] ExecError { error: DispatchError::Module {index:5, error:17, message: Some("ContractTrapped"), orign: ErrorOrigin::Caller }}
+#...
+    env_trace: [
+        seal_input(Some(0xd183512b008cb6611e0100000000000000000000)),
+        seal_caller(Some(0xd43593c715fdd31c61141abd04a99fd682)),
+        //...
+        seal_set_storage((Some(0x030000000100000...), Some(0x000000000000000...))),
+    ],
+    sandbox_result_ok: RuntimeValue::Value(7),
+    nest: [],
+}
+Dal registro sopra, possiamo vedere:
+
+La fine di env_tracenon termina con seal_return, significa che il contratto non è stato eseguito normalmente. Perché si può vedere dal design di ink!ciò se si entra #[ink(constructor)]normalmente o si entra #[ink(message)], quindi deve essere eseguito a ::ink_lang::execute_message ( ::ink_lang::execute_messagechiamerà seal_return) e l'assenza di seal_returnmezzi per cui l'esecuzione non ha raggiunto lo stadio di execute.
+
+sandbox_result_okindica che il valore restituito dall'esecuzione è 7. Interrogando ink!per l'implementazione di DispatchError, è possibile vedere che questo codice di errore rappresentaCouldNotReadInput
+
+DispatchError::CouldNotReadInput => Self(0x07),
+Secondo il codice espanso della macro del contratto, puoi vedere che nella dispatch_using_modefunzione, ::ink_env::decode_inputviene chiamato prima della chiamata executee questa funzione ha una return Errorsituazione. Pertanto, è ragionevole supporre che si sia verificata un'eccezione durante l'analisi input. Il parametro di input args:0x008cb6611e0100000000000000000000viene registrato nel registro. Osservando questo parametro, si può riscontrare che la sua lunghezza è notevolmente inferiore al u128codice. Pertanto, si può dedurre da argse env_traceche si è verificato un errore durante la decodifica input.
+
+// this part code is expanded by erc20 example.
+::ink_env::decode_input::<<Erc20 as ::ink_lang::ConstructorDispatcher>::Type>().map_err(|_| ::ink_lang::DispatchError::CouldNotReadInput)?
+A questo punto, l'istanza del contratto ha esito positivo, ma esiste il costruttore per eseguire l'istanza. Pertanto, il contratto esiste sulla catena ma il processo di #[ink(constructor)]non viene eseguito normalmente.
+
+Il callpalco, come la chiamata transfer:
+
+Chiamando transferla funzione di cui sopra istanziata con successo, ContractTrapapparirà, il registro di Europa mostra come segue:
+
+1: NestedRuntime {
+	ext_result: [failed] ExecError { error: DispatchError::Module {index:5, error:17, message: Some("ContractTrapped"), orign: ErrorOrigin::Caller }}
+# ...
+    env_trace: [
+        seal_value_transferred(Some(0x0000000000000000)),
+    ],
+    wasm_error: Error::WasmiExecution(Trap(Trap { kind: Unreachable }))
+    	wasm backtrace: 
+    	|  core::panicking::panic_fmt.60[1743]
+    	|  core::result::unwrap_failed[914]
+    	|  core::result::Result<T,E>::expect[915]
+    	|  ink_lang::dispatcher::deny_payment[1664]
+    	|  call[1691]
+    	╰─><unknown>[2387]
+    ,
+    nest: [],
+}
+Innanzitutto nota che l'ultima registrazione di non env_traceè ancora seal_returne la causa dell'errore wasm_errorè WasmiExecution::Unreachable. Pertanto, si può stabilire che panico è expectstato riscontrato durante l'esecuzione del contratto.
+
+Dal backtrace di wasm, è molto ovvio che il processo di esecuzione è
+
+   call -> deny_payment -> expect
+Secondo la macro espansa del codice ( cd ink/examples/erc20; cargo expand> tmp.rs), possiamo vedere:
+
+#[no_mangle]
+fn call() -> u32 {
+    if true {
+     ::ink_lang::deny_payment::<<Erc20 as ::ink_lang::ContractEnv>::Env>()
+    		.expect("caller transferred value even though all ink! message deny payments")
+    }
+    ::ink_lang::DispatchRetCode::from(
+        <Erc20 as ::ink_lang::DispatchUsingMode>::dispatch_using_mode(
+            ::ink_lang::DispatchMode::Call,
+        ),
+    )
+    .to_u32()
+}
+Pertanto, può essere giudicato che un errore è stato restituito nel deny_paymentcorso dell'esecuzione del contratto nel processo di transfer, e la trasformazione diretta dell'errore, come expecthanno determinato il risultato dell'esecuzione di wasmiessere Unreachablemonitoraggio del codice di deny_paymentpossono scoprire che restituisce la funzione expectcausati daError
+
+Nota ， Il codice pertinente è il seguente:
+
+In ink_langhttps://github.com/paritytech/ink/blob/master/crates/lang/src/dispatcher.rs#L140-L150
+
+pub fn deny_payment<E>() -> Result<()>
+where
+    E: Environment,
+{
+    let transferred = ink_env::transferred_balance::<E>()
+        .expect("encountered error while querying transferred balance");
+    if transferred != <E as Environment>::Balance::from(0u32) {
+        return Err(DispatchError::PaidUnpayableMessage)
+    }
+    Ok(())
+}
+Ci sarà una differenza tra la off_chainparte e la on_chainparte nell'inchiostro , off_chainpenserà che viene restituito un errore nella fase di ink_env::transferred_balance::<E>(), quindi è in esecuzione  After transferred_balance, incontrerai expectquale porta a panic, e parte di on_chainè presa dalla memoria di wasm, normalmente riceverà i caratteri corrispondenti alla lunghezza di u128 e decodificherà per ottenere transferred, che è appena decodificato Il risultato non soddisferà le aspettative, facendo transferred!=0sì che venga deny_paymentrestituito un errore, e la parte deny_paymentchiamata nell'espansione macro del contratto si innescaexpect
+
+if true {
+    ::ink_lang::deny_payment::<<Erc20 as ::ink_lang::ContractEnv>::Env>()
+    	.expect("caller transferred value even though all ink! message deny payments")
+}
+Pertanto, per wasm backtrace, expectappare quando deny_paymentviene richiamato call, non quando transferred_balanceviene richiamato deny_payment.
+
+This example side shows that ink! currently does not completely correspond to the processing of off_chain and on_chain, and may cause difficult-to-check errors for contract users in some cases
+
+Verify v0.2
+~~Construct incorrect contracts and execute logs printing to determine whether it meets expectations~~
+
+~~Display the call statistics of the define_env! interface during contract execution~~
+
+run test case instantiate_return_code in patractlabs/substrate branch:europa-contracts
+
+$ cd europa/vendor/substrate/frame/contracts
+$ cargo test --package pallet-contracts --lib tests::instantiate_return_code -- --exact
+# then you could see
+1: NestedRuntime {
+    caller: 0101010101010101010101010101010101010101010101010101010101010101 (5C62Ck4U...),
+# ...
+}
+    
+1: NestedRuntime {
+# ...
+}
+    
+1: NestedRuntime {
+# ...
+}
+# ...
+run test case run_out_of_gas in patractlabs/substrate branch:europa-contracts
+
+$ cd europa/vendor/substrate/frame/contracts
+$ cargo test --package pallet-contracts --lib tests::run_out_of_gas -- --exact
+1: NestedRuntime {
+# ...
+}
+    
+1: NestedRuntime {
+#...
+        gas(None),
+    ],
+    trap_reason: TrapReason::SupervisorError(DispatchError::Module { index: 0, error: 6, message: Some("OutOfGas") }),
+    nest: [],
+}
+Anyone can check whether the printed log matching with the test case.
+
+~~Execute the log printing function, provide formatted printing examples of different data, and judge whether it meets expectations~~
+
+Using ink-log in ink! example could test this part.
+
+~~Construct a contract that crashes under different conditions and record the log after execution. Then judge whether the backtrace information of the contract execution is completely printed, and check whether it matches the actual execution of the collapsed contract.~~
+
+We provide a test case repo europa_contracts_test_templates. Any one could using Polkadot/Substrate Portal or RedSpot to deploy and call this test contract to verify this.
+
+3. Recap of verification of v0.2
+~~Modify at FRAME Contracts pallet level to provide more information.*~~
+
+~~Construct incorrect contracts and execute logs printing to determine whether it meets expectations~~
+
+~~Display the call statistics of the define_env! interface during contract execution~~
+
+run test case instantiate_return_code in patractlabs/substrate branch:europa-contracts
+
+$ cd europa/vendor/substrate/frame/contracts
+$ cargo test --package pallet-contracts --lib tests::instantiate_return_code -- --exact
+# then you could see
+1: NestedRuntime {
+    caller: 0101010101010101010101010101010101010101010101010101010101010101 (5C62Ck4U...),
+# ...
+}
+    
+1: NestedRuntime {
+# ...
+}
+    
+1: NestedRuntime {
+# ...
+}
+# ...
+run test case run_out_of_gas in patractlabs/substrate branch:europa-contracts
+
+$ cd europa/vendor/substrate/frame/contracts
+$ cargo test --package pallet-contracts --lib tests::run_out_of_gas -- --exact
+1: NestedRuntime {
+# ...
+}
+    
+1: NestedRuntime {
+#...
+        gas(None),
+    ],
+    trap_reason: TrapReason::SupervisorError(DispatchError::Module { index: 0, error: 6, message: Some("OutOfGas") }),
+    nest: [],
+}
+Anyone can check whether the printed log matching with the test case.
+
+~~Execute the log printing function, provide formatted printing examples of different data, and judge whether it meets expectations~~
+
+Using ink-log in ink! example could test this part.
+
+~~Construct a contract that crashes under different conditions and record the log after execution. Then judge whether the backtrace information of the contract execution is completely printed, and check whether it matches the actual execution of the collapsed contract.~~
+
+We provide a test case repo europa_contracts_test_templates. Any one could using Polkadot/Substrate Portal or RedSpot to deploy and call this test contract to verify this.
+
+1hCM ... ayRL
+commentato
+ 
+9 giorni fa
+(modificato)
+Rapporto di revisione esterna per Europa v0.2:
+
+Modulo: QUI .
+
+Rapporto: QUI .
+
+Revisore: Shamb0
+
+Suggerimento aperto: qui (70 USD xh - TIME: 8hs), tasso: 36USD / DOT (EMA30 avg il 26.04.2021)
+
+Indirizzo DOT13W9zEq72quJ8m5sFHEGKJa1vxtfQAjAdHczqvmc7tQd7Lw9
+
+Segnala un problema
